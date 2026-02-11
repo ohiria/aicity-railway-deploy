@@ -11,13 +11,75 @@ import threading
 import json
 import asyncio
 import os
+import logging
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Callable
 from enum import Enum
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+
+logger = logging.getLogger("aicity")
+
+# ============================================================
+# OpenRouter API統合
+# ============================================================
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/moonshotai/kimi-k2-0905")
+LLM_ENABLED = bool(OPENROUTER_API_KEY)
+
+async def llm_think(citizen_name: str, role: str, mood: str, situation: str) -> Optional[str]:
+    """OpenRouter APIを使って市民の思考を生成"""
+    if not LLM_ENABLED:
+        return None
+    try:
+        prompt = f"""あなたは「{citizen_name}」という名前のAI市民です。
+職業: {role}
+現在の気分: {mood}
+状況: {situation}
+
+この状況で、あなたは何を考え、何をしますか？
+1〜2文の短い独り言を日本語で返してください。具体的で人間味のある内容にしてください。"""
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 80,
+                    "temperature": 0.9,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.warning(f"LLM思考エラー ({citizen_name}): {e}")
+    return None
+
+# 非同期思考キュー（APIレート制限対策）
+thought_queue: List[dict] = []
+thought_results: Dict[str, str] = {}
+
+async def process_thought_queue():
+    """バックグラウンドで市民の思考を処理"""
+    while True:
+        if thought_queue and LLM_ENABLED:
+            item = thought_queue.pop(0)
+            result = await llm_think(
+                item["name"], item["role"], item["mood"], item["situation"]
+            )
+            if result:
+                thought_results[item["name"]] = result
+        await asyncio.sleep(3)  # APIレート制限対策: 3秒間隔
 
 # ============================================================
 # 市民エージェント定義
@@ -92,6 +154,20 @@ class AICitizen:
         self._update_mood(city_state)
         self._form_goals(city_state)
         self._plan_actions()
+
+        # LLM思考をキューに追加（低確率で、APIコスト節約）
+        if LLM_ENABLED and random.random() < 0.05:
+            thought_queue.append({
+                "name": self.profile.name,
+                "role": self.profile.role.value,
+                "mood": self.profile.mood.value,
+                "situation": f"時刻は{city_state.get('time', '?')}時、季節は{city_state.get('season', '?')}。{'仕事中' if city_state.get('is_work_time') else '休憩中'}。所持金¥{self.profile.money:.0f}、健康{self.profile.health}/100。",
+            })
+
+        # LLM思考結果があれば反映
+        if self.profile.name in thought_results:
+            self.current_action = thought_results.pop(self.profile.name)
+
         return f"{self.profile.name}は{self.profile.mood.value}です。"
 
     def _update_mood(self, city_state: Dict):
@@ -401,7 +477,11 @@ async def lifespan(app: FastAPI):
     global simulation
     simulation = AICitySimulation(pop=30)
     simulation.start()
+    logger.info(f"LLM enabled: {LLM_ENABLED}")
+    # バックグラウンドタスク: LLM思考処理
+    task = asyncio.create_task(process_thought_queue())
     yield
+    task.cancel()
     if simulation:
         simulation.stop()
 
@@ -434,6 +514,10 @@ mgr = ConnectionManager()
 async def dashboard():
     return DASHBOARD_HTML
 
+
+@app.get("/api/status")
+async def api_status():
+    return {"llm_enabled": LLM_ENABLED, "model": OPENROUTER_MODEL if LLM_ENABLED else "none", "population": len(simulation.citizens) if simulation else 0}
 
 @app.get("/api/state")
 async def api_state():
@@ -548,6 +632,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans JP',sans
   <span><span class="pulse"></span> <b id="vtime">--</b></span>
   <span>🌿 季節: <b id="season">--</b></span>
   <span>📅 経過日数: <b id="days">0</b></span>
+  <span>🧠 AI: <b id="llm">確認中...</b></span>
 </div>
 <div class="grid">
   <div class="card">
@@ -635,6 +720,10 @@ function update(d){
   }
 }
 connect();
+fetch('/api/status').then(r=>r.json()).then(d=>{
+  $('llm').textContent=d.llm_enabled?'✅ '+d.model:'⚠️ ルールベース';
+  $('llm').style.color=d.llm_enabled?'#81c784':'#ffb74d';
+}).catch(()=>{$('llm').textContent='⚠️ 未接続'});
 </script>
 </body>
 </html>"""
